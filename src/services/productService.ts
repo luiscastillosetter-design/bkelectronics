@@ -1,5 +1,7 @@
-import { supabase } from '@/lib/supabase';
-import type { Product } from '@/data/products';
+// src/services/productService.ts
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
+import { products as seedProducts, type Product } from '@/data/products';
+import { useProductStore } from '@/store/productStore';
 
 const ICONS = {
   energia: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%2322d3ee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14H4z"/></svg>',
@@ -28,10 +30,9 @@ const getCategoryFallbackIcon = (category: string) => {
   return ICONS.default;
 };
 
-const formatProduct = (item: any): Product => {
+export const formatProduct = (item: any): Product => {
   const stockQty = Number(item.stock ?? 100);
   
-  // Extraer imágenes reales de Supabase (puede venir como array o como JSON stringificado)
   let parsedImages: string[] = [];
   if (Array.isArray(item.images)) {
     parsedImages = item.images.filter(Boolean);
@@ -42,23 +43,25 @@ const formatProduct = (item: any): Product => {
     } catch {
       parsedImages = [item.images];
     }
+  } else if (typeof item.image === 'string' && item.image.trim() !== '') {
+    parsedImages = [item.image];
   }
 
-  // Si Supabase no tiene fotos registradas para este producto, usamos el icono de respaldo de su categoría
   if (parsedImages.length === 0) {
-    const fallback = getCategoryFallbackIcon(item.category);
-    parsedImages = [fallback];
+    parsedImages = [getCategoryFallbackIcon(item.category)];
   }
+
+  const priceNum = Number(item.price) || 0;
 
   return {
-    id: String(item.id),
-    title: String(item.title || ''),
-    price: Number(item.price) || 0,
-    category: String(item.category || 'General'),
+    id: String(item.id || Date.now()),
+    title: String(item.title || item.name || 'Equipo BK Electronics'),
+    price: priceNum,
+    category: String(item.category || 'ENERGIA').toUpperCase(),
     stock: stockQty,
-    badge: stockQty <= 0 ? 'Agotado' : (Number(item.price) >= 50 ? 'Envío Gratis' : 'Oferta'),
+    badge: item.badge || (stockQty <= 0 ? 'Agotado' : priceNum >= 50 ? 'Envío Gratis' : 'Oferta'),
     images: parsedImages,
-    description: item.description || `${item.title}. Equipo con garantía oficial de BK Electronics. Ideal para integraciones profesionales.`,
+    description: item.description || `${item.title || 'Equipo técnico'}. Garantía oficial de BK Electronics. Ideal para integraciones profesionales.`,
     features: Array.isArray(item.features) && item.features.length > 0 
       ? item.features 
       : ['Garantía directa de tienda', 'Envíos a nivel nacional', 'Zelle, Pago Móvil, Efectivo y Binance'],
@@ -66,43 +69,93 @@ const formatProduct = (item: any): Product => {
   };
 };
 
+// Función auxiliar para leer el respaldo local (Zustand / LocalStorage / JSON estático)
+async function getLocalFallbackProducts(): Promise<Product[]> {
+  // 1. Revisar si ya hay productos cargados en Zustand / LocalStorage
+  const cached = useProductStore.getState().products;
+  if (Array.isArray(cached) && cached.length > seedProducts.length) {
+    return cached.map(formatProduct);
+  }
+
+  // 2. Intentar cargar /inventario.json si el usuario colocó allí los +1000 productos en public/
+  if (typeof window !== 'undefined') {
+    try {
+      const res = await fetch('/inventario.json', { cache: 'no-store' });
+      if (res.ok) {
+        const jsonData = await res.json();
+        if (Array.isArray(jsonData) && jsonData.length > 0) {
+          const formatted = jsonData.map(formatProduct);
+          useProductStore.getState().setProducts(formatted, true);
+          return formatted;
+        }
+      }
+    } catch {
+      // Si no existe /inventario.json, continúa silenciosamente
+    }
+  }
+
+  // 3. Devolver lo que haya en Zustand o la semilla por defecto
+  const finalFallback = (Array.isArray(cached) && cached.length > 0 ? cached : seedProducts).map(formatProduct);
+  useProductStore.getState().setProducts(finalFallback, true);
+  return finalFallback;
+}
+
 export const productService = {
   async getProducts(): Promise<Product[]> {
-    try {
-      const { data, error } = await supabase.from('products').select('*').order('id', { ascending: true });
-      if (error || !data) return [];
-      return data.map(formatProduct);
-    } catch (err) {
-      console.error("Error cargando productos:", err);
-      return [];
+    if (isSupabaseConfigured) {
+      try {
+        // Timeout de 2.5 segundos para evitar que la tienda se congele si Supabase está caído
+        const timeoutPromise = new Promise<{ data: null; error: Error }>((resolve) =>
+          setTimeout(() => resolve({ data: null, error: new Error('Supabase Timeout') }), 2500)
+        );
+
+        const supabasePromise = supabase
+          .from('products')
+          .select('*')
+          .order('id', { ascending: true });
+
+        const { data, error } = await Promise.race([supabasePromise, timeoutPromise]);
+
+        if (!error && Array.isArray(data) && data.length > 0) {
+          const formatted = data.map(formatProduct);
+          useProductStore.getState().setProducts(formatted, false);
+          return formatted;
+        }
+      } catch (err) {
+        console.warn('Supabase no disponible, activando motor local Zustand:', err);
+      }
     }
+
+    return getLocalFallbackProducts();
   },
 
   async getProductById(id: string): Promise<Product | undefined> {
-    try {
-      const { data, error } = await supabase.from('products').select('*').eq('id', id).maybeSingle();
-      if (error || !data) return undefined;
-      return formatProduct(data);
-    } catch (err) {
-      console.error(`Error cargando producto ${id}:`, err);
-      return undefined;
+    if (isSupabaseConfigured) {
+      try {
+        const { data, error } = await supabase
+          .from('products')
+          .select('*')
+          .eq('id', id)
+          .maybeSingle();
+        if (!error && data) return formatProduct(data);
+      } catch {
+        // Pasa al respaldo local
+      }
     }
+
+    const allProducts = await getLocalFallbackProducts();
+    return allProducts.find((p) => String(p.id) === String(id));
   },
 
   async getRelatedProducts(category: string, currentProductId: string): Promise<Product[]> {
-    try {
-      const { data, error } = await supabase
-        .from('products')
-        .select('*')
-        .eq('category', category)
-        .neq('id', currentProductId)
-        .limit(10);
-        
-      if (error || !data) return [];
-      return data.map(formatProduct);
-    } catch (err) {
-      console.error("Error cargando productos relacionados:", err);
-      return [];
-    }
-  }
+    const allProducts = await this.getProducts();
+    const targetCat = (category || '').toUpperCase();
+    return allProducts
+      .filter(
+        (p) =>
+          String(p.id) !== String(currentProductId) &&
+          (p.category.toUpperCase().includes(targetCat) || targetCat.includes(p.category.toUpperCase()))
+      )
+      .slice(0, 10);
+  },
 };

@@ -4,11 +4,13 @@ import { useState, useEffect, useMemo } from 'react';
 import { 
   Plus, Trash2, Pencil, X, Lock, ArrowLeft, CheckCircle, 
   Image as ImageIcon, Video, Settings, ShoppingBag, Layers, 
-  Sliders, Zap, Search 
+  Sliders, Zap, Search, Upload
 } from 'lucide-react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
 import { siteConfig } from '@/config/site';
+import { productService, formatProduct } from '@/services/productService';
+import { useProductStore } from '@/store/productStore';
 
 const defaultCategories = [
   { id: 'Todos', name: 'Catálogo Completo', image: '/categories/todos.png' },
@@ -131,10 +133,8 @@ export default function AdminPage() {
     }
 
     const loadProducts = async () => {
-      const { data, error } = await supabase.from('products').select('*').order('id', { ascending: true });
-      if (!error && data) {
-        setProducts(data);
-      }
+      const data = await productService.getProducts();
+      setProducts(data);
     };
     loadProducts();
 
@@ -204,7 +204,53 @@ export default function AdminPage() {
     return url.endsWith('.mp4') || url.includes('.mp4?') || url.startsWith('data:video');
   };
 
-  // --- CRUD PRODUCTOS ---
+  // --- IMPORTADOR MASIVO DE EMERGENCIA (JSON / CSV -> ZUSTAND + LOCALSTORAGE) ---
+  const handleBulkFileImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const content = String(event.target?.result || '');
+        let rawList: any[] = [];
+
+        if (file.name.endsWith('.json')) {
+          const parsed = JSON.parse(content);
+          rawList = Array.isArray(parsed) ? parsed : (parsed.products || parsed.data || []);
+        } else if (file.name.endsWith('.csv')) {
+          const lines = content.split(/\r?\n/).filter((l) => l.trim() !== '');
+          if (lines.length > 1) {
+            const headers = lines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, '').toLowerCase());
+            rawList = lines.slice(1).map((line, idx) => {
+              const values = line.split(',').map((v) => v.trim().replace(/^"|"$/g, ''));
+              const obj: any = { id: String(idx + 1) };
+              headers.forEach((h, i) => {
+                obj[h] = values[i] ?? '';
+              });
+              return obj;
+            });
+          }
+        }
+
+        if (rawList.length > 0) {
+          const formatted = rawList.map(formatProduct);
+          useProductStore.getState().bulkImportProducts(formatted);
+          setProducts(formatted);
+          showNotification(`¡${formatted.length} equipos cargados exitosamente en Zustand + LocalStorage!`);
+        } else {
+          showNotification('No se encontraron productos válidos en el archivo.');
+        }
+      } catch (err) {
+        console.error('Error importando archivo:', err);
+        showNotification('Error al leer el archivo. Verifica que sea un JSON o CSV válido.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  // --- CRUD PRODUCTOS HÍBRIDO (ZUSTAND + SUPABASE) ---
   const handleSaveProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!productForm.title || !productForm.price) return;
@@ -219,7 +265,8 @@ export default function AdminPage() {
     const numericStock = Number(productForm.stock ?? 100);
 
     if (editingProductId) {
-      const updatedProduct = {
+      const updatedProduct = formatProduct({
+        id: editingProductId,
         title: productForm.title,
         price: numericPrice,
         stock: numericStock,
@@ -227,19 +274,35 @@ export default function AdminPage() {
         description: productForm.description,
         features: parsedFeatures,
         images: cleanImages
-      };
-      
-      const { error } = await supabase.from('products').update(updatedProduct).eq('id', editingProductId);
-      if (!error) {
-        const updated = products.map((p) => p.id === editingProductId ? { ...p, ...updatedProduct } : p);
-        setProducts(updated);
-        setEditingProductId(null);
-        showNotification('¡Equipo actualizado exitosamente en Supabase!');
-      } else {
-        showNotification('Error al actualizar en Supabase.');
+      });
+
+      // 1. Guardar inmediatamente en Zustand + LocalStorage
+      useProductStore.getState().updateProduct(String(editingProductId), updatedProduct);
+      setProducts((prev) => prev.map((p) => String(p.id) === String(editingProductId) ? updatedProduct : p));
+      setEditingProductId(null);
+
+      // 2. Intentar sincronizar con Supabase en segundo plano
+      try {
+        const { error } = await supabase.from('products').update({
+          title: updatedProduct.title,
+          price: updatedProduct.price,
+          stock: updatedProduct.stock,
+          category: updatedProduct.category,
+          description: updatedProduct.description,
+          features: updatedProduct.features,
+          images: updatedProduct.images
+        }).eq('id', editingProductId);
+
+        if (!error) {
+          showNotification('¡Equipo actualizado en Zustand y Supabase!');
+        } else {
+          showNotification('¡Equipo actualizado en Modo Local (Zustand)!');
+        }
+      } catch {
+        showNotification('¡Equipo actualizado en Modo Local (Zustand)!');
       }
     } else {
-      const newItem = {
+      const newItem = formatProduct({
         id: String(Date.now()),
         title: productForm.title,
         price: numericPrice,
@@ -248,14 +311,32 @@ export default function AdminPage() {
         description: productForm.description,
         features: parsedFeatures,
         images: cleanImages,
-      };
-      
-      const { error } = await supabase.from('products').insert([newItem]);
-      if (!error) {
-        setProducts([newItem, ...products]);
-        showNotification('¡Nuevo equipo agregado a Supabase!');
-      } else {
-        showNotification('Error al agregar a Supabase.');
+      });
+
+      // 1. Guardar inmediatamente en Zustand + LocalStorage
+      useProductStore.getState().addProduct(newItem);
+      setProducts((prev) => [newItem, ...prev]);
+
+      // 2. Intentar sincronizar con Supabase en segundo plano
+      try {
+        const { error } = await supabase.from('products').insert([{
+          id: newItem.id,
+          title: newItem.title,
+          price: newItem.price,
+          stock: newItem.stock,
+          category: newItem.category,
+          description: newItem.description,
+          features: newItem.features,
+          images: newItem.images,
+        }]);
+
+        if (!error) {
+          showNotification('¡Nuevo equipo agregado en Zustand y Supabase!');
+        } else {
+          showNotification('¡Nuevo equipo agregado en Modo Local (Zustand)!');
+        }
+      } catch {
+        showNotification('¡Nuevo equipo agregado en Modo Local (Zustand)!');
       }
     }
 
@@ -295,24 +376,29 @@ export default function AdminPage() {
   };
 
   const handleDeleteProduct = async (id: any) => {
-    const { error } = await supabase.from('products').delete().eq('id', id);
-    if (!error) {
-      setProducts(products.filter((p) => p.id !== id));
-      showNotification('Equipo eliminado de Supabase');
-      if (editingProductId === id) {
-        setEditingProductId(null);
-        setProductForm({
-          title: '',
-          price: '',
-          stock: '100',
-          category: 'ENERGIA',
-          description: '',
-          features: '',
-          images: ['', '', '', ''],
-        });
-      }
-    } else {
-      showNotification('Error al eliminar de Supabase');
+    // 1. Eliminar inmediatamente de Zustand + LocalStorage
+    useProductStore.getState().deleteProduct(String(id));
+    setProducts((prev) => prev.filter((p) => String(p.id) !== String(id)));
+    showNotification('Equipo eliminado del catálogo');
+
+    if (editingProductId === id) {
+      setEditingProductId(null);
+      setProductForm({
+        title: '',
+        price: '',
+        stock: '100',
+        category: 'ENERGIA',
+        description: '',
+        features: '',
+        images: ['', '', '', ''],
+      });
+    }
+
+    // 2. Intentar eliminar en Supabase en segundo plano
+    try {
+      await supabase.from('products').delete().eq('id', id);
+    } catch {
+      // Ignorar si Supabase está caído
     }
   };
 
@@ -517,7 +603,7 @@ export default function AdminPage() {
             Consola Admin • {storeName}
           </h1>
           <span className="hidden sm:inline-block bg-cyan-950/80 border border-cyan-500/40 text-cyan-300 text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-widest">
-            Conectado a Supabase
+            Motor Híbrido Activo (Zustand + Cloud)
           </span>
         </div>
         <div className="flex items-center gap-4">
@@ -787,30 +873,44 @@ export default function AdminPage() {
                       : 'bg-cyan-500 hover:bg-cyan-400 text-slate-900 shadow-[0_0_20px_rgba(6,182,212,0.3)]'
                   }`}
                 >
-                  {editingProductId ? 'Guardar Cambios en Supabase' : 'Publicar Equipo en Catálogo'}
+                  {editingProductId ? 'Guardar Cambios' : 'Publicar Equipo en Catálogo'}
                 </button>
               </form>
             </div>
 
-            {/* Listado de Inventario con Buscador en Vivo (7 u 8 columnas en PC) */}
+            {/* Listado de Inventario con Buscador e Importador Masivo (7 u 8 columnas en PC) */}
             <div className="lg:col-span-7 xl:col-span-8 bg-[#0F172A] p-6 rounded-3xl shadow-xl border border-slate-800">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-800">
                 <div>
                   <h2 className="text-lg font-black text-white uppercase tracking-wider">
                     Inventario Activo ({filteredInventory.length})
                   </h2>
-                  <p className="text-xs text-slate-400">Sincronizado en tiempo real con la base de datos de {siteConfig.storeName}.</p>
+                  <p className="text-xs text-slate-400">Respaldado con Zustand + LocalStorage para disponibilidad inmediata.</p>
                 </div>
 
-                <div className="relative w-full sm:w-72">
-                  <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="search"
-                    placeholder="Filtrar por nombre, ID o categoría..."
-                    value={adminSearch}
-                    onChange={(e) => setAdminSearch(e.target.value)}
-                    className="w-full pl-9 pr-3 py-2 bg-[#0B1120] border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
-                  />
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {/* Botón para importar los +1000 productos en JSON o CSV */}
+                  <label className="flex items-center gap-2 px-3.5 py-2 bg-cyan-500/15 hover:bg-cyan-500 hover:text-slate-900 text-cyan-400 border border-cyan-500/40 rounded-xl text-xs font-black uppercase tracking-wider cursor-pointer transition-all">
+                    <Upload className="w-4 h-4" />
+                    <span>Importar JSON / CSV</span>
+                    <input
+                      type="file"
+                      accept=".json,.csv"
+                      onChange={handleBulkFileImport}
+                      className="hidden"
+                    />
+                  </label>
+
+                  <div className="relative w-full sm:w-64">
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="search"
+                      placeholder="Filtrar por nombre, ID o categoría..."
+                      value={adminSearch}
+                      onChange={(e) => setAdminSearch(e.target.value)}
+                      className="w-full pl-9 pr-3 py-2 bg-[#0B1120] border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                    />
+                  </div>
                 </div>
               </div>
 

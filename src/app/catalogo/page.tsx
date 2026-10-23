@@ -2,7 +2,6 @@
 
 import { useEffect, useState, Suspense, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import Image from 'next/image';
 import Link from 'next/link';
 import { siteConfig } from '@/config/site';
 import { productService } from '@/services/productService';
@@ -38,7 +37,6 @@ function CatalogoContent() {
       setIsLoading(true);
       const data = await productService.getProducts();
       setProducts(data);
-      setFilteredProducts(data);
       setIsLoading(false);
     };
     loadProducts();
@@ -47,19 +45,17 @@ function CatalogoContent() {
   useEffect(() => {
     const categoryParam = searchParams.get('category');
     
-    if (products.length > 0) {
-      if (!categoryParam || categoryParam.toLowerCase() === 'todos') {
-        setActiveCategory('Todos');
-        setFilteredProducts(products);
-      } else {
-        setActiveCategory(categoryParam);
-        const filtered = products.filter((p) => {
-          const prodCat = (p.category || '').toUpperCase();
-          const targetCat = categoryParam.toUpperCase();
-          return prodCat.includes(targetCat) || targetCat.includes(prodCat);
-        });
-        setFilteredProducts(filtered);
-      }
+    if (!categoryParam || categoryParam.toLowerCase() === 'todos') {
+      setActiveCategory('Todos');
+      setFilteredProducts(products);
+    } else {
+      setActiveCategory(categoryParam);
+      const targetCat = categoryParam.toUpperCase();
+      const filtered = products.filter((p) => {
+        const prodCat = (p.category || '').toUpperCase();
+        return prodCat.includes(targetCat) || targetCat.includes(prodCat);
+      });
+      setFilteredProducts(filtered);
     }
   }, [searchParams, products]);
 
@@ -170,7 +166,6 @@ function CatalogoContent() {
               <Link key={product.id} href={`/product/${product.id}`} className="group h-full block">
                 <div className="bg-[#0F172A]/90 border border-slate-800/90 rounded-2xl overflow-hidden transition-all duration-300 h-full flex flex-col hover:-translate-y-1 hover:border-cyan-500/60 hover:shadow-[0_0_20px_rgba(6,182,212,0.15)]">
                   
-                  {/* Ícono pequeño, centrado y con padding (object-contain p-8) */}
                   <div className="relative w-full aspect-[4/5] bg-[#070b14] overflow-hidden flex items-center justify-center">
                     <img
                       src={product.images[0]}
